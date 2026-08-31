@@ -2,34 +2,17 @@ require('dotenv').config();
 const { App } = require('@slack/bolt');
 const fetch = require('node-fetch');
 const Papa = require('papaparse');
-const { BigQuery } = require('@google-cloud/bigquery');
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
 
-// ── BigQuery (validador de Merchant ID) ─────────────────────
-// ⚠️ AJUSTA si el proyecto/dataset/tabla o los nombres de columna reales de
-// "obt_merchant" son distintos (merchant_id / merchant_name / merchant_channel).
-const BQ_PROJECT = process.env.BQ_PROJECT || 'apz-analytics-prod';
-const BQ_DATASET = process.env.BQ_DATASET || 'analytics';
-const BQ_MERCHANT_TABLE = process.env.BQ_MERCHANT_TABLE || 'obt_merchant';
-const BQ_FULL_TABLE = `\`${BQ_PROJECT}.${BQ_DATASET}.${BQ_MERCHANT_TABLE}\``;
-const bigquery = new BigQuery({ projectId: BQ_PROJECT });
-
 // ── Constantes ──────────────────────────────────────────────
-const APPROVER_NEW_USERS = 'U0AKGADMDCH'; // Dani Blanca
+const APPROVER_NEW_USERS = 'U0AKGADMDCH'; // tú
 const APPROVER_OTHER = 'U09QUKD5AUR';     // María Cervantes
-
-// Aprobadores oficiales (dropdown "¿Por quién?")
-const APPROVER_OPTIONS = [
-  { text: { type: 'plain_text', text: 'María Cervantes' }, value: 'U09QUKD5AUR' },
-  { text: { type: 'plain_text', text: 'Dani Blanca' }, value: 'U0AKGADMDCH' },
-  { text: { type: 'plain_text', text: 'Fer Berrón' }, value: 'U09TUBP3DSQ' },
-  { text: { type: 'plain_text', text: 'Omar Tueme' }, value: 'U078S6DJBU4' },
-  { text: { type: 'plain_text', text: 'Rodrigo Ayora' }, value: 'U0203NN2GD9' },
-];
+const APPROVER_FEE_DOWNPAYMENT_1 = 'U07JTCJQZSQ'; // Aristeo (Teo)
+const APPROVER_FEE_DOWNPAYMENT_2 = 'U0B2K1S349L'; // Daniela Ayala
 
 const TIPOS_CON_PUNTOS = ['cashback', 'reto', 'award'];
 const TIPOS_FORM_SIMPLE = ['fee0', 'downpayment0'];
@@ -44,7 +27,6 @@ const TIPO_OPTIONS = [
   { text: { type: 'plain_text', text: '0 downpayment' }, value: 'downpayment0' },
   { text: { type: 'plain_text', text: 'Descuento Afiliados' }, value: 'afiliados' },
   { text: { type: 'plain_text', text: 'Otro' }, value: 'otro' },
-  // 'Automática' eliminada a petición de María
 ];
 
 const BUSINESS_LINE_OPTIONS = ['BNPL', 'VC', 'PC', 'Walmart', 'Ali', 'Todos', 'Combo'];
@@ -74,6 +56,28 @@ function extractStateValues(values) {
 function opt(text, value) { return { text: { type: 'plain_text', text }, value }; }
 function findOpt(options, value) { return options.find(o => o.value === value); }
 function findOpts(options, values) { return options.filter(o => (values || []).includes(o.value)); }
+
+// Convierte el valor interno de Tipo (ej. 'reto') al texto visible (ej. 'Reto') para mensajes en Slack
+function tipoDisplay(tipoValue) {
+  const found = findOpt(TIPO_OPTIONS, tipoValue);
+  return found ? found.text.text : (tipoValue || 'NA');
+}
+
+// Arma la línea de "Descuento" del resumen, distinta según la ruta (normal vs. corta)
+function formatDescuentoLinea(a) {
+  if (isFormSimple(a)) {
+    const minimo = a.minimo_compra_simple || 'NA';
+    return `💸 Mínimo de compra: ${minimo}`;
+  }
+  const valor = a.valor_descuento || 'NA';
+  const tipoDesc = a.tipo_descuento || '';
+  let descuentoStr;
+  if (tipoDesc === '%') descuentoStr = `${valor}%`;
+  else if (tipoDesc === '$') descuentoStr = `$${valor}`;
+  else descuentoStr = tipoDesc ? `${valor} (${tipoDesc})` : valor;
+  const minimoValido = a.minimo_compra && a.minimo_compra.toUpperCase() !== 'NA';
+  return `💸 Descuento: ${descuentoStr}${minimoValido ? ` · Mínimo de compra: ${a.minimo_compra}` : ''}`;
+}
 function valueFromText(options, text) {
   if (!text) return null;
   const t = text.trim().toLowerCase();
@@ -82,97 +86,6 @@ function valueFromText(options, text) {
 }
 function reqLabel(text) { return { type: 'plain_text', text: `${text} *` }; }
 function hintBlock(text) { return { type: 'context', elements: [{ type: 'mrkdwn', text }] }; }
-
-function splitList(text) {
-  return (text || '')
-    .split(/[\n,]+/)
-    .map(s => s.trim())
-    .filter(Boolean);
-}
-
-// ── Validador de Merchant ID contra BigQuery (obt_merchant) ─
-// Reglas confirmadas con María:
-// - No es línea por línea: basta con que, para cada Merchant ID, exista
-//   AL MENOS UN nombre en el campo de texto libre que haga match con el
-//   merchant_name real de ese ID (el orden no importa, pero cada ID debe
-//   encontrar su propio match).
-// - Si un ID no existe o no encuentra match de nombre, se bloquea el avance.
-// - El canal (Online/Offline/Ambos) se calcula automáticamente.
-async function lookupMerchants(ids) {
-  if (!ids.length) return [];
-  const query = `
-    SELECT merchant_id, merchant_name, merchant_channel
-    FROM ${BQ_FULL_TABLE}
-    WHERE CAST(merchant_id AS STRING) IN UNNEST(@ids)
-  `;
-  const [rows] = await bigquery.query({ query, params: { ids } });
-  return rows;
-}
-
-async function validateMerchantsBatch(idsText, namesText) {
-  // "promotionsall" = comodín para todos los comercios, no se valida contra BigQuery
-  if ((idsText || '').trim().toLowerCase() === 'promotionsall') {
-    return { ok: true, canal: 'Ambos' };
-  }
-
-  const ids = splitList(idsText);
-  const namesInput = splitList(namesText).map(n => n.toLowerCase());
-
-  if (!ids.length) {
-    return { ok: false, error: 'Agrega al menos un Merchant ID.' };
-  }
-
-  const rows = await lookupMerchants(ids);
-  const byId = {};
-  for (const r of rows) byId[String(r.merchant_id)] = r;
-
-  const channels = new Set();
-
-  for (const id of ids) {
-    const row = byId[id];
-    if (!row) {
-      return { ok: false, error: `⚠️ El Merchant ID ${id} no existe en el catálogo.` };
-    }
-    const canonicalName = (row.merchant_name || '').toLowerCase();
-    const hasMatch = namesInput.some(n => n && (canonicalName.includes(n) || n.includes(canonicalName)));
-    if (!hasMatch) {
-      return { ok: false, error: `⚠️ Merchant ID y Merchant Name no corresponden (ID ${id} → "${row.merchant_name}").` };
-    }
-    if (row.merchant_channel) channels.add(String(row.merchant_channel).toLowerCase());
-  }
-
-  let canal = 'Ambos';
-  if (channels.size === 1) {
-    const c = [...channels][0];
-    canal = c.includes('online') ? 'Online' : c.includes('offline') ? 'Offline' : 'Ambos';
-  }
-
-  return { ok: true, canal };
-}
-
-// ── Alerta de código de cupón duplicado ─────────────────────
-// Requiere que el Apps Script tenga un branch para action: 'checkCode' que
-// responda { exists: true/false } buscando el código en "Promociones Aplazo 2026".
-// Si el Apps Script no responde o truena, NO se bloquea el flujo (fail-open).
-async function checkCodeExists(codigo) {
-  if (!codigo || codigo.trim().toUpperCase() === 'NA') return false;
-  try {
-    const res = await fetch(process.env.APPS_SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        secret: process.env.APPS_SCRIPT_SECRET,
-        action: 'checkCode',
-        codigo,
-      }),
-    });
-    const data = await res.json();
-    return !!data.exists;
-  } catch (err) {
-    console.error('No se pudo validar duplicado de código en Apps Script:', err);
-    return false;
-  }
-}
 
 function blocksPage1(a) {
   return [
@@ -214,11 +127,10 @@ function blocksPage2(a) {
     { type: 'input', block_id: 'b_merchant_id_compra', label: reqLabel('Merchant id'),
       element: { type: 'plain_text_input', action_id: 'merchant_id_compra', multiline: true, ...(a.merchant_id_compra ? { initial_value: a.merchant_id_compra } : {}) } },
     hintBlock(MERCHANT_ID_HINT),
-    { type: 'input', block_id: 'b_merchant_channel', label: { type: 'plain_text', text: 'Merchant channel' }, optional: true,
+    { type: 'input', block_id: 'b_merchant_channel', label: reqLabel('Merchant channel'),
       element: { type: 'static_select', action_id: 'merchant_channel',
         options: ['Online', 'Offline', 'Ambos'].map(t => opt(t, t)),
         ...(a.merchant_channel ? { initial_option: opt(a.merchant_channel, a.merchant_channel) } : {}) } },
-    hintBlock('Se calcula automáticamente a partir de los Merchant IDs al darle "Siguiente"; ajústalo solo si hace falta.'),
   ];
 }
 
@@ -258,7 +170,7 @@ function blocksPagePuntos(a) {
 }
 
 function blocksPageSimple(a) {
-  return [
+  const blocks = [
     { type: 'input', block_id: 'b_minimo_compra_simple', label: reqLabel('Monto mínimo de compra'),
       element: { type: 'plain_text_input', action_id: 'minimo_compra_simple', ...(a.minimo_compra_simple ? { initial_value: a.minimo_compra_simple } : {}) } },
     { type: 'input', block_id: 'b_fecha_inicio_simple', label: reqLabel('Fecha inicio'),
@@ -273,11 +185,10 @@ function blocksPageSimple(a) {
     hintBlock(MERCHANT_ID_HINT),
     { type: 'input', block_id: 'b_usuarios_simple', label: reqLabel('Usuarios a los que aplica'),
       element: { type: 'plain_text_input', action_id: 'usuarios_simple', placeholder: { type: 'plain_text', text: 'Ej. Bandas de riesgo A y B' }, ...(a.usuarios_simple ? { initial_value: a.usuarios_simple } : {}) } },
-    { type: 'input', block_id: 'b_merchant_channel_simple', label: { type: 'plain_text', text: 'Merchant channel' }, optional: true,
+    { type: 'input', block_id: 'b_merchant_channel_simple', label: reqLabel('Merchant channel'),
       element: { type: 'static_select', action_id: 'merchant_channel_simple',
         options: ['Online', 'Offline', 'Ambos'].map(t => opt(t, t)),
         ...(a.merchant_channel_simple ? { initial_option: opt(a.merchant_channel_simple, a.merchant_channel_simple) } : {}) } },
-    hintBlock('Se calcula automáticamente a partir de los Merchant IDs al darle "Siguiente"; ajústalo solo si hace falta.'),
     { type: 'input', block_id: 'b_business_line_simple', label: reqLabel('Merchant business line'),
       element: { type: 'multi_static_select', action_id: 'business_line_simple',
         options: BUSINESS_LINE_OPTIONS.map(t => opt(t, t)),
@@ -285,36 +196,47 @@ function blocksPageSimple(a) {
     { type: 'input', block_id: 'b_pay_now_simple', label: reqLabel('¿Incluye Pay Now?'),
       element: { type: 'static_select', action_id: 'pay_now_simple',
         options: ['Sí', 'No'].map(t => opt(t, t)),
-        ...(a.pay_now_simple ? { initial_option: opt(a.pay_now_simple, a.pay_now_simple) } : {}) } },
+        initial_option: opt(a.pay_now_simple || 'No', a.pay_now_simple || 'No') } },
   ];
+
+  return blocks;
 }
 
 function blocksPage5(a) {
   const blocks = [
+    { type: 'input', block_id: 'b_business_line', label: reqLabel('Business line'),
+      element: { type: 'multi_static_select', action_id: 'business_line',
+        options: BUSINESS_LINE_OPTIONS.map(t => opt(t, t)),
+        ...(a.business_line && a.business_line.length ? { initial_options: findOpts(BUSINESS_LINE_OPTIONS.map(t => opt(t, t)), a.business_line) } : {}) } },
     { type: 'input', block_id: 'b_audiencia', label: reqLabel('Audiencia'), dispatch_action: true,
       element: { type: 'static_select', action_id: 'audiencia',
         options: ['Nuevos', 'Recurrentes', 'Todos', 'Segmento específico'].map(t => opt(t, t)),
         ...(a.audiencia ? { initial_option: opt(a.audiencia, a.audiencia) } : {}) } },
   ];
   if (a.audiencia === 'Segmento específico') {
-    blocks.push({ type: 'input', block_id: 'b_audiencia_especifica', label: reqLabel('Adjunta liga al archivo con el segmento'),
+    blocks.push({ type: 'input', block_id: 'b_audiencia_especifica', label: reqLabel('Especifica el segmento'),
       element: { type: 'plain_text_input', action_id: 'audiencia_especifica', ...(a.audiencia_especifica ? { initial_value: a.audiencia_especifica } : {}) } });
   }
-  blocks.push(
-    { type: 'input', block_id: 'b_business_line', label: reqLabel('Business line'),
-      element: { type: 'multi_static_select', action_id: 'business_line',
-        options: BUSINESS_LINE_OPTIONS.map(t => opt(t, t)),
-        ...(a.business_line && a.business_line.length ? { initial_options: findOpts(BUSINESS_LINE_OPTIONS.map(t => opt(t, t)), a.business_line) } : {}) } },
-    { type: 'input', block_id: 'b_pay_now', label: reqLabel('¿Incluye Pay Now?'),
-      element: { type: 'static_select', action_id: 'pay_now',
-        options: ['Sí', 'No'].map(t => opt(t, t)),
-        ...(a.pay_now ? { initial_option: opt(a.pay_now, a.pay_now) } : {}) } }
-  );
+  blocks.push({ type: 'input', block_id: 'b_pay_now', label: reqLabel('¿Incluye Pay Now?'),
+    element: { type: 'static_select', action_id: 'pay_now',
+      options: ['Sí', 'No'].map(t => opt(t, t)),
+      ...(a.pay_now ? { initial_option: opt(a.pay_now, a.pay_now) } : {}) } });
   return blocks;
 }
 
 function blocksPage6(a) {
   const blocks = [
+    { type: 'input', block_id: 'b_objetivo_promo', label: { type: 'plain_text', text: '¿Cuál es el objetivo de tu promo?' }, optional: true,
+      element: { type: 'plain_text_input', action_id: 'objetivo_promo', multiline: true,
+        ...(a.objetivo_promo ? { initial_value: a.objetivo_promo } : {}) } },
+    hintBlock('Ej: Incrementar GMV del comercio en 30%, adquirir nuevos usuarios para el canal Walmart, descuento negociado para lanzar X comercio, etc.'),
+    { type: 'input', block_id: 'b_budget_estimado', label: { type: 'plain_text', text: 'Budget estimado' }, optional: true,
+      element: { type: 'plain_text_input', action_id: 'budget_estimado', placeholder: { type: 'plain_text', text: 'Número, o NA si no aplica' },
+        ...(a.budget_estimado ? { initial_value: a.budget_estimado } : {}) } },
+    { type: 'input', block_id: 'b_estrategia_comunicacion', label: { type: 'plain_text', text: '¿Cuál es la estrategia de comunicación?' }, optional: true,
+      element: { type: 'plain_text_input', action_id: 'estrategia_comunicacion', multiline: true,
+        ...(a.estrategia_comunicacion ? { initial_value: a.estrategia_comunicacion } : {}) } },
+    hintBlock('Ej: campaña de CRM para usuarios recurrentes, material POP en 3 sucursales, este descuento no se comunicará, etc.'),
     { type: 'input', block_id: 'b_comentarios', label: { type: 'plain_text', text: 'Comentarios adicionales' }, optional: true,
       element: { type: 'plain_text_input', action_id: 'comentarios', multiline: true,
         placeholder: { type: 'plain_text', text: 'Ej. cupón válido para merchant X en fecha Y, y merchant Z en fecha W; o lista/segmento específico de usuarios' },
@@ -326,9 +248,7 @@ function blocksPage6(a) {
   ];
   if (a.aprobado === 'Sí') {
     blocks.push({ type: 'input', block_id: 'b_aprobado_por', label: reqLabel('¿Por quién?'),
-      element: { type: 'static_select', action_id: 'aprobado_por',
-        options: APPROVER_OPTIONS,
-        ...(a.aprobado_por ? { initial_option: findOpt(APPROVER_OPTIONS, a.aprobado_por) } : {}) } });
+      element: { type: 'plain_text_input', action_id: 'aprobado_por', ...(a.aprobado_por ? { initial_value: a.aprobado_por } : {}) } });
   }
   return blocks;
 }
@@ -391,6 +311,47 @@ function validatePage2(a) {
 
 // Validación compartida entre el modal individual y la carga masiva (una sola fuente de verdad).
 // A medida que se definan más reglas de negocio, agregarlas aquí para que apliquen a ambos flujos.
+// Consulta al Apps Script si un código de cupón ya fue usado antes (en cualquier pestaña).
+// No aplica si el código viene vacío o es "NA" (nada que checar).
+// Consulta al Apps Script si los Merchant id(s) existen en dim_merchant y si el/los nombre(s)
+// coinciden (por posición). Devuelve un arreglo de mensajes de error (vacío si todo está bien).
+async function checkMerchantsValid(merchantId, merchantName) {
+  if (!merchantId) return [];
+  try {
+    const res = await fetch(process.env.APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret: process.env.APPS_SCRIPT_SECRET,
+        action: 'checkMerchants',
+        merchant_id: merchantId,
+        merchant_name: merchantName,
+      }),
+    });
+    const json = await res.json();
+    return json.errores || [];
+  } catch (err) {
+    console.error('Error al verificar merchants contra BigQuery (se deja pasar para no bloquear):', err);
+    return []; // si falla la consulta, no bloqueamos el submit — solo se pierde la protección esta vez
+  }
+}
+
+async function checkCodigoExists(codigo, fechaInicio, fechaFin) {
+  if (!codigo || codigo.trim().toUpperCase() === 'NA') return false;
+  try {
+    const res = await fetch(process.env.APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: process.env.APPS_SCRIPT_SECRET, action: 'checkCode', codigo, fecha_inicio: fechaInicio, fecha_fin: fechaFin }),
+    });
+    const json = await res.json();
+    return !!json.exists;
+  } catch (err) {
+    console.error('Error al verificar código duplicado (se deja pasar para no bloquear):', err);
+    return false; // si falla la consulta, no bloqueamos el submit — solo se pierde la protección esta vez
+  }
+}
+
 function validateRow(a) {
   const errores = [];
   if (!a.tipo) errores.push('Tipo de promoción vacío o no reconocido (revisa que coincida con el texto exacto de las opciones)');
@@ -416,11 +377,24 @@ function validateRow(a) {
 
 app.command('/promo-request', async ({ ack, body, client }) => {
   await ack();
-  // Requester se autocompleta con quien está usando el modal
-  await client.views.open({ trigger_id: body.trigger_id, view: buildView('p1', { requester: body.user_id }) });
+  await client.views.open({ trigger_id: body.trigger_id, view: buildView('p1', {}) });
 });
 
 // ── Carga masiva vía CSV ──────────────────────────────────────
+// Columnas que SIEMPRE deben existir en el header del CSV (independiente del Tipo de cada fila).
+// Código y las columnas de puntos son condicionales por fila, se validan en validateRow, no aquí.
+const REQUIRED_CSV_HEADERS = [
+  'tipo', 'merchant name', 'merchant id', 'fecha inicio', 'fecha fin',
+  'usos por usuario', 'business line', 'audiencia', 'pay now',
+];
+
+// Revisa que el header del CSV traiga todas las columnas obligatorias.
+// No valida columnas de más — esas simplemente se ignoran sin generar error.
+function validateCsvHeader(fields) {
+  const headersLower = (fields || []).map(f => f.trim().toLowerCase());
+  return REQUIRED_CSV_HEADERS.filter(h => !headersLower.includes(h));
+}
+
 const CSV_HEADER_MAP = {
   'tipo': 'tipo',
   'tipo de descuento': 'tipo_descuento',
@@ -502,9 +476,7 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
   const requesterId = body.user.id;
 
   if (!fileInfo) {
-    if (process.env.SLACK_CHANNEL_ID) {
-      await client.chat.postMessage({ channel: process.env.SLACK_CHANNEL_ID, text: `⚠️ <@${requesterId}> intentó una carga masiva sin adjuntar archivo.` });
-    }
+    await client.chat.postMessage({ channel: requesterId, text: `⚠️ Tu carga masiva no se procesó porque no adjuntaste ningún archivo. Corre \`/promo-bulk\` de nuevo y adjunta el CSV.` });
     return;
   }
 
@@ -518,8 +490,19 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
     const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     const rows = parsed.data;
 
+    // Validar el header ANTES de tocar cualquier fila — si falta una columna obligatoria,
+    // se aborta todo el archivo con un mensaje claro, en vez de generar errores confusos por fila.
+    const columnasFaltantes = validateCsvHeader(parsed.meta.fields);
+    if (columnasFaltantes.length) {
+      const mensaje = `❌ Tu carga masiva no se procesó: el archivo no tiene el formato correcto. Faltan estas columnas: ${columnasFaltantes.join(', ')}. Revisa que estés usando la plantilla más reciente.`;
+      await client.chat.postMessage({ channel: requesterId, text: mensaje });
+      return;
+    }
+
     let exitosas = 0;
     const erroresPorFila = [];
+    const conteoTipos = {}; // ej. { 'Promocode': 2, 'Reto': 1 }
+    const codigosExitosos = []; // ej. ['VERANO20', 'CASHBACK15']
 
     for (let i = 0; i < rows.length; i++) {
       const a = normalizeCsvRow(rows[i]);
@@ -531,6 +514,15 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
         erroresPorFila.push(`Fila ${i + 2}: ${errores.join('; ')}`); // +2 = considerar header + índice 1-based
         continue;
       }
+
+      // ── Chequeo de código duplicado — igual que en el modal individual ──
+      const yaExiste = await checkCodigoExists(a.codigo, a.fecha_inicio, a.fecha_fin);
+      if (yaExiste) {
+        erroresPorFila.push(`Fila ${i + 2}: el código "${a.codigo}" ya existe en el sheet, no se documentó`);
+        continue;
+      }
+
+      // ── Chequeo de Merchant id/name contra BigQuery: pausado por ahora ──
 
       let requesterEmail = '';
       try {
@@ -552,26 +544,40 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
           body: JSON.stringify(payload),
         });
         exitosas++;
+        const tipoLabel = tipoDisplay(a.tipo);
+        conteoTipos[tipoLabel] = (conteoTipos[tipoLabel] || 0) + 1;
+        codigosExitosos.push(a.codigo && a.codigo.toUpperCase() !== 'NA' ? a.codigo : `Fila ${i + 2} (sin código)`);
       } catch (err) {
         erroresPorFila.push(`Fila ${i + 2}: error al escribir en Sheets (${err.message})`);
       }
     }
 
-    const resumen = [
-      `📦 *Carga masiva procesada*`,
-      `Requester: <@${requesterId}> (${equipo})`,
-      `✅ ${exitosas} promociones documentadas`,
-      erroresPorFila.length ? `⚠️ ${erroresPorFila.length} filas con error:\n${erroresPorFila.map(e => `• ${e}`).join('\n')}` : null,
-    ].filter(Boolean).join('\n');
-
+    // ── Éxito → canal (visibilidad del equipo) ──
     if (process.env.SLACK_CHANNEL_ID) {
-      await client.chat.postMessage({ channel: process.env.SLACK_CHANNEL_ID, text: resumen });
+      const desgloseTipos = Object.entries(conteoTipos).map(([tipo, n]) => `${n} ${tipo}`).join(', ');
+      const resumenCanal = [
+        `📦 *Carga masiva procesada*`,
+        `👤 Requester: <@${requesterId}> (${equipo})`,
+        `✅ ${exitosas} promociones documentadas${desgloseTipos ? ` (${desgloseTipos})` : ''}`,
+        erroresPorFila.length ? `⚠️ ${erroresPorFila.length} fila(s) con error — detalle enviado por DM a <@${requesterId}>` : null,
+      ].filter(Boolean).join('\n');
+      await client.chat.postMessage({ channel: process.env.SLACK_CHANNEL_ID, text: resumenCanal });
+    }
+
+    // ── Errores → DM al requester (no al canal). Si todo salió bien, no se manda nada. ──
+    if (erroresPorFila.length) {
+      const resumenDM = [
+        `⚠️ *Tu carga masiva tuvo ${erroresPorFila.length} fila(s) con error:*`,
+        erroresPorFila.map(e => `• ${e}`).join('\n'),
+        codigosExitosos.length
+          ? `\n✅ *Estos sí se documentaron bien (${codigosExitosos.length}):*\n${codigosExitosos.map(c => `• ${c}`).join('\n')}`
+          : `\n⚠️ Ninguna fila se documentó — revisa los errores de arriba.`,
+      ].join('\n');
+      await client.chat.postMessage({ channel: requesterId, text: resumenDM });
     }
   } catch (err) {
     console.error('Error procesando carga masiva:', err);
-    if (process.env.SLACK_CHANNEL_ID) {
-      await client.chat.postMessage({ channel: process.env.SLACK_CHANNEL_ID, text: `❌ <@${requesterId}> la carga masiva falló: ${err.message}` });
-    }
+    await client.chat.postMessage({ channel: requesterId, text: `❌ Tu carga masiva falló por un error inesperado: ${err.message}` });
   }
 });
 
@@ -591,49 +597,13 @@ function extractStateValuesRaw(values) {
 app.view('promo_step_view', async ({ ack, body }) => {
   const meta = JSON.parse(body.view.private_metadata || '{}');
   const merged = { ...meta.answers, ...extractStateValues(body.view.state.values) };
-
   if (meta.step === 'p2') {
     const errors = validatePage2(merged);
     if (Object.keys(errors).length) {
       await ack({ response_action: 'errors', errors });
       return;
     }
-
-    try {
-      const result = await validateMerchantsBatch(merged.merchant_id_compra, merged.merchant_name_compra);
-      if (!result.ok) {
-        await ack({ response_action: 'errors', errors: { b_merchant_name_compra: result.error } });
-        return;
-      }
-      merged.merchant_channel = result.canal;
-    } catch (err) {
-      console.error('Error validando merchants contra BigQuery:', err);
-      await ack({ response_action: 'errors', errors: { b_merchant_id_compra: 'No se pudo validar los Merchant IDs en este momento. Intenta de nuevo.' } });
-      return;
-    }
-
-    const duplicado = await checkCodeExists(merged.codigo);
-    if (duplicado) {
-      await ack({ response_action: 'errors', errors: { b_codigo: `⚠️ El código "${merged.codigo}" ya existe en Promociones Aplazo 2026. Usa uno distinto o verifica antes de continuar.` } });
-      return;
-    }
   }
-
-  if (meta.step === 'p_simple') {
-    try {
-      const result = await validateMerchantsBatch(merged.merchant_id_simple, merged.merchant_name_simple);
-      if (!result.ok) {
-        await ack({ response_action: 'errors', errors: { b_merchant_name_simple: result.error } });
-        return;
-      }
-      merged.merchant_channel_simple = result.canal;
-    } catch (err) {
-      console.error('Error validando merchants contra BigQuery:', err);
-      await ack({ response_action: 'errors', errors: { b_merchant_id_simple: 'No se pudo validar los Merchant IDs en este momento. Intenta de nuevo.' } });
-      return;
-    }
-  }
-
   const to = nextStep(meta.step, merged);
   await ack({ response_action: 'update', view: buildView(to, merged) });
 });
@@ -661,9 +631,15 @@ app.action('aprobado', async ({ ack, body, client }) => {
 });
 
 app.view('promo_final_submit', async ({ ack, body, client }) => {
-  await ack();
   const meta = JSON.parse(body.view.private_metadata || '{}');
   const a = { ...meta.answers, ...extractStateValues(body.view.state.values) };
+
+  if (a.budget_estimado && a.budget_estimado.toUpperCase() !== 'NA' && !NUMERIC_RE.test(a.budget_estimado)) {
+    await ack({ response_action: 'errors', errors: { b_budget_estimado: 'Escribe solo un número, o NA si no aplica.' } });
+    return;
+  }
+
+  await ack();
 
   let requesterEmail = '';
   try {
@@ -673,9 +649,26 @@ app.view('promo_final_submit', async ({ ack, body, client }) => {
     console.error('No se pudo resolver el correo del requester:', err);
   }
 
-  let tagUser = null;
+  // ── Chequeo de código duplicado — si ya existe, se aborta antes de escribir a Sheets ──
+  const yaExiste = await checkCodigoExists(a.codigo, a.fecha_inicio, a.fecha_fin);
+  if (yaExiste) {
+    await client.chat.postMessage({
+      channel: a.requester,
+      text: `⚠️ Tu solicitud de promoción con código *${a.codigo}* no se documentó porque ese código ya existe en el sheet. Vuelve a correr \`/promo-request\` con un código distinto.`,
+    });
+    return;
+  }
+
+  // ── Chequeo de Merchant id/name contra BigQuery: pausado por ahora (checkMerchantsValid queda definida, sin usarse) ──
+
+  let tagUsers = [];
   if (a.aprobado === 'No') {
-    tagUser = a.audiencia === 'Nuevos' ? APPROVER_NEW_USERS : APPROVER_OTHER;
+    if (isFormSimple(a)) {
+      // 0% fee y 0 downpayment siempre etiquetan a estos 2, sin importar la audiencia
+      tagUsers = [APPROVER_FEE_DOWNPAYMENT_1, APPROVER_FEE_DOWNPAYMENT_2];
+    } else {
+      tagUsers = [a.audiencia === 'Nuevos' ? APPROVER_NEW_USERS : APPROVER_OTHER];
+    }
   }
 
   const payload = {
@@ -698,18 +691,19 @@ app.view('promo_final_submit', async ({ ack, body, client }) => {
     console.error('Error al escribir en Google Sheets vía Apps Script:', err);
   }
 
-  const aprobadorOpt = a.aprobado === 'Sí' ? findOpt(APPROVER_OPTIONS, a.aprobado_por) : null;
   const aprobacionLinea = a.aprobado === 'Sí'
-    ? `✅ Descuento ya aprobado por *${aprobadorOpt ? aprobadorOpt.text.text : (a.aprobado_por || 'N/A')}*`
-    : `⚠️ Pendiente de aprobación — atención <@${tagUser}>`;
+    ? `✅ Descuento ya aprobado por ${a.aprobado_por || 'N/A'}`
+    : `⚠️ Pendiente de aprobación — atención ${tagUsers.map(u => `<@${u}>`).join(' ')}`;
 
   const resumen = [
     `🎟️ *Nueva solicitud de promoción*`,
-    `Requester: <@${a.requester}> (${a.equipo})`,
-    isFormSimple(a) ? `Tipo: ${a.tipo}` : `Tipo: ${a.tipo} · Código: ${a.codigo || 'NA'}`,
-    `Vigencia: ${a.fecha_inicio} – ${a.fecha_fin}`,
+    `👤 Requester: <@${a.requester}> (${a.equipo})`,
+    isFormSimple(a) ? `🏷️ Tipo: ${tipoDisplay(a.tipo)}` : `🏷️ Tipo: ${tipoDisplay(a.tipo)} · Código: ${a.codigo || 'NA'}`,
+    formatDescuentoLinea(a),
+    `📅 Vigencia: ${a.fecha_inicio} → ${a.fecha_fin}`,
+    a.audiencia ? `🎯 Audiencia: ${a.audiencia}` : null,
     aprobacionLinea,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 
   if (process.env.SLACK_CHANNEL_ID) {
     try {
@@ -727,3 +721,5 @@ app.view('promo_final_submit', async ({ ack, body, client }) => {
   await app.start(port);
   console.log(`⚡ Promo Slack App corriendo en puerto ${port}`);
 })();
+
+
