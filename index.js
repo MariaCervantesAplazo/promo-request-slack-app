@@ -11,9 +11,11 @@ const app = new App({
 // ── Constantes ──────────────────────────────────────────────
 const APPROVER_NEW_USERS = 'U0AKGADMDCH'; // tú
 const APPROVER_OTHER = 'U09QUKD5AUR';     // María Cervantes
+const APPROVER_FEE_DOWNPAYMENT_1 = 'U07JTCJQZSQ'; // Aristeo (Teo)
+const APPROVER_FEE_DOWNPAYMENT_2 = 'U0B2K1S349L'; // Daniela Ayala
 
 const TIPOS_CON_PUNTOS = ['cashback', 'reto', 'award'];
-const TIPOS_FORM_SIMPLE = ['fee0'];
+const TIPOS_FORM_SIMPLE = ['fee0', 'downpayment0'];
 const TIPOS_COMO_PROMOCODE = ['promocode', 'afiliados'];
 
 const TIPO_OPTIONS = [
@@ -22,8 +24,8 @@ const TIPO_OPTIONS = [
   { text: { type: 'plain_text', text: 'Reto' }, value: 'reto' },
   { text: { type: 'plain_text', text: 'Award' }, value: 'award' },
   { text: { type: 'plain_text', text: '0% fee' }, value: 'fee0' },
+  { text: { type: 'plain_text', text: '0 downpayment' }, value: 'downpayment0' },
   { text: { type: 'plain_text', text: 'Descuento Afiliados' }, value: 'afiliados' },
-  { text: { type: 'plain_text', text: 'Automática' }, value: 'automatica' },
   { text: { type: 'plain_text', text: 'Otro' }, value: 'otro' },
 ];
 
@@ -334,13 +336,13 @@ async function checkMerchantsValid(merchantId, merchantName) {
   }
 }
 
-async function checkCodigoExists(codigo) {
+async function checkCodigoExists(codigo, fechaInicio, fechaFin) {
   if (!codigo || codigo.trim().toUpperCase() === 'NA') return false;
   try {
     const res = await fetch(process.env.APPS_SCRIPT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ secret: process.env.APPS_SCRIPT_SECRET, action: 'checkCode', codigo }),
+      body: JSON.stringify({ secret: process.env.APPS_SCRIPT_SECRET, action: 'checkCode', codigo, fecha_inicio: fechaInicio, fecha_fin: fechaFin }),
     });
     const json = await res.json();
     return !!json.exists;
@@ -500,6 +502,7 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
     let exitosas = 0;
     const erroresPorFila = [];
     const conteoTipos = {}; // ej. { 'Promocode': 2, 'Reto': 1 }
+    const codigosExitosos = []; // ej. ['VERANO20', 'CASHBACK15']
 
     for (let i = 0; i < rows.length; i++) {
       const a = normalizeCsvRow(rows[i]);
@@ -513,7 +516,7 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
       }
 
       // ── Chequeo de código duplicado — igual que en el modal individual ──
-      const yaExiste = await checkCodigoExists(a.codigo);
+      const yaExiste = await checkCodigoExists(a.codigo, a.fecha_inicio, a.fecha_fin);
       if (yaExiste) {
         erroresPorFila.push(`Fila ${i + 2}: el código "${a.codigo}" ya existe en el sheet, no se documentó`);
         continue;
@@ -543,6 +546,7 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
         exitosas++;
         const tipoLabel = tipoDisplay(a.tipo);
         conteoTipos[tipoLabel] = (conteoTipos[tipoLabel] || 0) + 1;
+        codigosExitosos.push(a.codigo && a.codigo.toUpperCase() !== 'NA' ? a.codigo : `Fila ${i + 2} (sin código)`);
       } catch (err) {
         erroresPorFila.push(`Fila ${i + 2}: error al escribir en Sheets (${err.message})`);
       }
@@ -560,11 +564,14 @@ app.view('promo_bulk_submit', async ({ ack, body, client }) => {
       await client.chat.postMessage({ channel: process.env.SLACK_CHANNEL_ID, text: resumenCanal });
     }
 
-    // ── Errores → DM al requester (no al canal) ──
+    // ── Errores → DM al requester (no al canal). Si todo salió bien, no se manda nada. ──
     if (erroresPorFila.length) {
       const resumenDM = [
         `⚠️ *Tu carga masiva tuvo ${erroresPorFila.length} fila(s) con error:*`,
         erroresPorFila.map(e => `• ${e}`).join('\n'),
+        codigosExitosos.length
+          ? `\n✅ *Estos sí se documentaron bien (${codigosExitosos.length}):*\n${codigosExitosos.map(c => `• ${c}`).join('\n')}`
+          : `\n⚠️ Ninguna fila se documentó — revisa los errores de arriba.`,
       ].join('\n');
       await client.chat.postMessage({ channel: requesterId, text: resumenDM });
     }
@@ -643,7 +650,7 @@ app.view('promo_final_submit', async ({ ack, body, client }) => {
   }
 
   // ── Chequeo de código duplicado — si ya existe, se aborta antes de escribir a Sheets ──
-  const yaExiste = await checkCodigoExists(a.codigo);
+  const yaExiste = await checkCodigoExists(a.codigo, a.fecha_inicio, a.fecha_fin);
   if (yaExiste) {
     await client.chat.postMessage({
       channel: a.requester,
@@ -654,9 +661,14 @@ app.view('promo_final_submit', async ({ ack, body, client }) => {
 
   // ── Chequeo de Merchant id/name contra BigQuery: pausado por ahora (checkMerchantsValid queda definida, sin usarse) ──
 
-  let tagUser = null;
+  let tagUsers = [];
   if (a.aprobado === 'No') {
-    tagUser = a.audiencia === 'Nuevos' ? APPROVER_NEW_USERS : APPROVER_OTHER;
+    if (isFormSimple(a)) {
+      // 0% fee y 0 downpayment siempre etiquetan a estos 2, sin importar la audiencia
+      tagUsers = [APPROVER_FEE_DOWNPAYMENT_1, APPROVER_FEE_DOWNPAYMENT_2];
+    } else {
+      tagUsers = [a.audiencia === 'Nuevos' ? APPROVER_NEW_USERS : APPROVER_OTHER];
+    }
   }
 
   const payload = {
@@ -681,7 +693,7 @@ app.view('promo_final_submit', async ({ ack, body, client }) => {
 
   const aprobacionLinea = a.aprobado === 'Sí'
     ? `✅ Descuento ya aprobado por ${a.aprobado_por || 'N/A'}`
-    : `⚠️ Pendiente de aprobación — atención <@${tagUser}>`;
+    : `⚠️ Pendiente de aprobación — atención ${tagUsers.map(u => `<@${u}>`).join(' ')}`;
 
   const resumen = [
     `🎟️ *Nueva solicitud de promoción*`,
@@ -709,4 +721,5 @@ app.view('promo_final_submit', async ({ ack, body, client }) => {
   await app.start(port);
   console.log(`⚡ Promo Slack App corriendo en puerto ${port}`);
 })();
+
 
